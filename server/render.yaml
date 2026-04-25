@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: two-user-message-server
+    runtime: python
+    plan: free
+    buildCommand: "python -m pip install --upgrade pip"
+    startCommand: "python server.py"
+    envVars:
+      - key: DB_PATH
+        value: /tmp/messages.sqlite3
