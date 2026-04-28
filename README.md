@@ -1,77 +1,145 @@
-# Two-User Local Messaging App
+# Secure Chat Application
 
-This app includes:
-- A local REST server storing messages in SQLite
-- A Python CLI client for terminal usage
+This application is a Render-compatible rewrite of the earlier prototype.
 
-## Features
+It provides:
 
-- Only users `A` and `B` are allowed
-- `send` stores one message at a time with IST timestamp
-- `read` returns unread messages for the current user in arrival order
-- Messages returned by `read` are deleted immediately from the database
+- WebSocket transport for Render deployment
+- App-layer certificate authentication using challenge-response
+- Client identity derived from the certificate common name
+- `/connect` realtime chat mode relayed through the server
+- `/send` offline message send mode backed by SQLite
+- `/read` one-by-one offline message reading with a fresh passphrase prompt
+- `/status` sender-side read/pending visibility
 
-## Run server
+## Architecture
 
-```bash
-python3 server.py --host 127.0.0.1 --port 8000
-```
+- Render terminates public HTTPS/WSS at its edge.
+- The chat server runs an HTTP health endpoint at `/healthz`.
+- Realtime and command traffic run over WebSockets at `/ws`.
+- The client proves certificate ownership by signing a server-issued nonce with the private key unlocked from the passphrase.
+- The server verifies the client certificate against `certificates/ca.crt`.
 
-Optional:
-- `--db /path/to/messages.sqlite3` to choose DB location
-- Environment variables are also supported:
-  - `HOST` (default `0.0.0.0`)
-  - `PORT` (default `8000`)
-  - `DB_PATH` (SQLite file path)
+## File layout
 
-## Deploy on Render
+- `client/client.py`: interactive terminal client
+- `server/server.py`: Render-compatible WebSocket server with SQLite storage
+- `common.py`: shared protocol and certificate helpers
+- `requirements.txt`: Python dependencies for deployment
+- `render.yaml`: Render Blueprint
+- `generate_certs.sh`: reproducible client-certificate generation script
+- `certificates/`: local CA and client certificates
 
-This folder includes `render.yaml` for one-click blueprint deploy.
+## Generate certificates
 
-- Start command: `python server.py`
-- Health endpoint: `GET /health`
-- Render injects `PORT`; server reads it automatically.
+The application uses only certificates under `secure_chat_app/certificates`.
 
-Important for SQLite on Render:
-- `DB_PATH` is set to `/tmp/messages.sqlite3` in `render.yaml` (ephemeral storage).
-- For persistent messages, attach a Render disk and set `DB_PATH` to something like `/var/data/messages.sqlite3`.
-
-## Read Passphrase Authentication
-
-`/messages/read` requires a shared passphrase.
-
-1) Choose a short passphrase (example: `lotus47`)
-2) Generate SHA-256 hash:
+Run:
 
 ```bash
-python3 - <<'PY'
-import hashlib
-print(hashlib.sha256("lotus47".encode("utf-8")).hexdigest())
-PY
+cd /Users/skinger/ZedProjects/secure_chat_app
+./generate_certs.sh
 ```
 
-3) Set server environment variable:
-- `READ_KEY_SHA256=<the hash value>`
-
-Client behavior:
-- `chat.py` and `cli.py` prompt for passphrase on every read
-- Client sends only SHA-256 hash (`read_key_hash`) for authentication
-
-## CLI usage
-
-From another terminal:
+The script runs these OpenSSL commands:
 
 ```bash
-python3 cli.py --user A send "Hello from A"
-python3 cli.py --user B read
+openssl genrsa -out certificates/ca.key 4096
+openssl req -x509 -new -key certificates/ca.key -sha256 -days 3650 -out certificates/ca.crt -subj "/CN=Secure Chat CA"
+
+openssl genrsa -aes256 -passout pass:changeit-a -out certificates/a.key 2048
+openssl req -new -key certificates/a.key -passin pass:changeit-a -out certificates/a.csr -subj "/CN=A"
+openssl x509 -req -in certificates/a.csr -CA certificates/ca.crt -CAkey certificates/ca.key -CAcreateserial -out certificates/a.crt -days 825 -sha256
+
+openssl genrsa -aes256 -passout pass:changeit-b -out certificates/b.key 2048
+openssl req -new -key certificates/b.key -passin pass:changeit-b -out certificates/b.csr -subj "/CN=B"
+openssl x509 -req -in certificates/b.csr -CA certificates/ca.crt -CAkey certificates/ca.key -CAcreateserial -out certificates/b.crt -days 825 -sha256
 ```
 
-More examples:
+Default demo passphrases:
+
+- Client A: `changeit-a`
+- Client B: `changeit-b`
+
+You can regenerate with different passphrases by exporting `CLIENT_A_PASSPHRASE` and `CLIENT_B_PASSPHRASE` before running the script.
+
+## Local server run
 
 ```bash
-python3 cli.py --user B send "Reply from B"
-python3 cli.py --user A read
-python3 cli.py --user A read
+cd /Users/skinger/ZedProjects/secure_chat_app
+python3 -m pip install -r requirements.txt
+python3 server/server.py --host 127.0.0.1 --port 10000
 ```
 
-If no unread messages are present, `read` prints `No unread messages.`
+## Local client run
+
+Terminal 1:
+
+```bash
+cd /Users/skinger/ZedProjects/secure_chat_app
+python3 client/client.py \
+  --host 127.0.0.1 \
+  --port 10000 \
+  --cert certificates/a.crt \
+  --key certificates/a.key
+```
+
+Terminal 2:
+
+```bash
+cd /Users/skinger/ZedProjects/secure_chat_app
+python3 client/client.py \
+  --host 127.0.0.1 \
+  --port 10000 \
+  --cert certificates/b.crt \
+  --key certificates/b.key
+```
+
+## Render deployment
+
+The checked-in [render.yaml](/Users/skinger/ZedProjects/secure_chat_app/render.yaml) is intended for this server.
+
+It defines:
+
+- a Python web service
+- dependency install via `requirements.txt`
+- startup with `python server/server.py --host 0.0.0.0`
+- a health check path at `/healthz`
+- `DB_PATH=/tmp/messages.sqlite3`
+- `CA_CERT_PATH=./certificates/ca.crt`
+- `WS_PATH=/ws`
+
+Files required in the deployed repo:
+
+- `render.yaml`
+- `requirements.txt`
+- `server/server.py`
+- `common.py`
+- `certificates/ca.crt`
+
+Do not deploy private client keys to Render:
+
+- `certificates/a.key`
+- `certificates/b.key`
+- `certificates/ca.key`
+
+## Render client connection
+
+After deployment, connect the clients to the public Render URL with `wss://`.
+
+Example:
+
+```bash
+python3 client/client.py \
+  --server-url wss://your-render-service.onrender.com/ws \
+  --cert certificates/a.crt \
+  --key certificates/a.key
+```
+
+## Commands
+
+- `/connect`: enter realtime mode with the other user
+- `/send`: enter offline send mode to the other user and keep sending until `/q`
+- `/read`: read pending offline messages one by one using `n` and `q`
+- `/status`: show pending count and details of the latest 3 read messages
+- `/exit`: close the client

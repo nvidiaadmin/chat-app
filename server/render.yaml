@@ -1,10 +1,15 @@
 services:
   - type: web
-    name: two-user-message-server
+    name: secure-chat-server
     runtime: python
     plan: free
-    buildCommand: "python -m pip install --upgrade pip"
-    startCommand: "python server.py"
+    buildCommand: "python -m pip install --upgrade pip && pip install -r requirements.txt"
+    startCommand: "python server/server.py --host 0.0.0.0"
+    healthCheckPath: /healthz
     envVars:
       - key: DB_PATH
         value: /tmp/messages.sqlite3
+      - key: CA_CERT_PATH
+        value: ./certificates/ca.crt
+      - key: WS_PATH
+        value: /ws
