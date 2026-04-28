@@ -4,7 +4,7 @@ This application is a Render-compatible rewrite of the earlier prototype.
 
 It provides:
 
-- WebSocket transport for Render deployment
+- `aiohttp` HTTP + WebSocket transport for Render deployment
 - App-layer certificate authentication using challenge-response
 - Client identity derived from the certificate common name
 - `/connect` realtime chat mode relayed through the server
@@ -15,7 +15,7 @@ It provides:
 ## Architecture
 
 - Render terminates public HTTPS/WSS at its edge.
-- The chat server runs an HTTP health endpoint at `/healthz`.
+- The chat server runs HTTP health endpoints at `/health` and `/healthz`.
 - Realtime and command traffic run over WebSockets at `/ws`.
 - The client proves certificate ownership by signing a server-issued nonce with the private key unlocked from the passphrase.
 - The server verifies the client certificate against `certificates/ca.crt`.
@@ -23,7 +23,7 @@ It provides:
 ## File layout
 
 - `client/client.py`: interactive terminal client
-- `server/server.py`: Render-compatible WebSocket server with SQLite storage
+- `server/server.py`: Render-compatible `aiohttp` server with SQLite storage
 - `common.py`: shared protocol and certificate helpers
 - `requirements.txt`: Python dependencies for deployment
 - `render.yaml`: Render Blueprint

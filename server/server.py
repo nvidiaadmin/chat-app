@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render-compatible WebSocket chat server with certificate-based app auth."""
+"""Render-compatible aiohttp chat server with certificate-based app auth."""
 
 from __future__ import annotations
 
@@ -13,13 +13,11 @@ import sqlite3
 import sys
 from dataclasses import dataclass
 from datetime import datetime
-from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from websockets.asyncio.server import ServerConnection, serve
-from websockets.exceptions import ConnectionClosed
+from aiohttp import WSMsgType, web
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -176,10 +174,14 @@ class MessageRepository:
                 """,
                 (sender,),
             ).fetchall()
+            read_count = connection.execute(
+                "SELECT COUNT(*) FROM read_receipts WHERE sender = ?",
+                (sender,),
+            ).fetchone()[0]
 
         return {
             "pending_count": int(pending_count),
-            "read_count": self._read_count_for_sender(sender),
+            "read_count": int(read_count),
             "read_messages": [
                 {
                     "recipient": row["recipient"],
@@ -190,17 +192,6 @@ class MessageRepository:
                 for row in receipts
             ],
         }
-
-    def _read_count_for_sender(self, sender: str) -> int:
-        """Return the total number of read receipts for a sender."""
-
-        with self._connect() as connection:
-            return int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM read_receipts WHERE sender = ?",
-                    (sender,),
-                ).fetchone()[0]
-            )
 
 
 @dataclass
@@ -214,7 +205,7 @@ class RealtimeState:
 class ClientConnection:
     """Represents one authenticated WebSocket client connection."""
 
-    def __init__(self, websocket: ServerConnection, identity: str) -> None:
+    def __init__(self, websocket: web.WebSocketResponse, identity: str) -> None:
         self.websocket = websocket
         self.identity = identity
         self.realtime = RealtimeState()
@@ -222,7 +213,7 @@ class ClientConnection:
     async def send(self, payload: dict[str, Any]) -> None:
         """Send one JSON protocol payload."""
 
-        await self.websocket.send(encode_message(payload))
+        await self.websocket.send_str(encode_message(payload))
 
     async def send_response(self, request_id: str | None, ok: bool, **payload: Any) -> None:
         """Send a structured response tied to a request id."""
@@ -245,16 +236,17 @@ class CertificateAuthenticator:
             Path(ca_certificate_path).expanduser().resolve().read_text(encoding="utf-8")
         )
 
-    async def authenticate(self, websocket: ServerConnection) -> ClientConnection:
+    async def authenticate(self, websocket: web.WebSocketResponse) -> ClientConnection:
         """Challenge the client and verify its signed certificate proof."""
 
         nonce = secrets.token_urlsafe(32)
-        await websocket.send(encode_message({"type": "auth_challenge", "nonce": nonce}))
+        await websocket.send_str(encode_message({"type": "auth_challenge", "nonce": nonce}))
 
-        raw_message = await asyncio.wait_for(websocket.recv(), timeout=10)
-        if not isinstance(raw_message, str):
-            raise ProtocolError("Authentication payload must be text.")
-        payload = decode_message(raw_message)
+        message = await asyncio.wait_for(websocket.receive(), timeout=10)
+        if message.type != WSMsgType.TEXT:
+            raise ProtocolError("Authentication payload must be a text frame.")
+
+        payload = decode_message(message.data)
         if str(payload.get("type", "")).strip() != "auth_response":
             raise ProtocolError("Expected auth_response during authentication.")
 
@@ -395,44 +387,55 @@ class RealtimeCoordinator:
 
 
 class SecureChatServer:
-    """Owns the WebSocket listener, request handling, and persistence layers."""
+    """Owns the aiohttp application, request handling, and persistence layers."""
 
     def __init__(self, host: str, port: int, path: str, database_path: str | Path, ca_cert: str | Path) -> None:
         self._host = host
         self._port = port
-        self._path = path
+        self._path = path if path.startswith("/") else f"/{path}"
         self._repository = MessageRepository(database_path)
         self._authenticator = CertificateAuthenticator(ca_cert)
         self._realtime = RealtimeCoordinator()
 
     async def run(self) -> None:
-        """Start serving websocket clients until the process receives SIGTERM."""
+        """Start serving HTTP and websocket clients until the process receives SIGTERM."""
 
+        app = web.Application()
+        app.add_routes(
+            [
+                web.get("/health", self._health_handler),
+                web.head("/health", self._health_handler),
+                web.get("/healthz", self._health_handler),
+                web.head("/healthz", self._health_handler),
+                web.get(self._path, self._websocket_handler),
+            ]
+        )
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, self._host, self._port)
+        await site.start()
+        print(f"Secure chat server listening on {self._host}:{self._port}{self._path}")
+
+        stop_event = asyncio.Event()
         loop = asyncio.get_running_loop()
-        stop = loop.create_future()
         with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(signal.SIGTERM, stop.set_result, None)
+            loop.add_signal_handler(signal.SIGTERM, stop_event.set)
+            loop.add_signal_handler(signal.SIGINT, stop_event.set)
 
-        async with serve(
-            self._handle_websocket,
-            host=self._host,
-            port=self._port,
-            process_request=self._process_request,
-        ):
-            print(f"Secure chat server listening on {self._host}:{self._port}{self._path}")
-            await stop
+        await stop_event.wait()
+        await runner.cleanup()
 
-    def _process_request(self, connection: ServerConnection, request: Any) -> Any:
-        """Handle HTTP health checks and reject non-chat paths."""
+    async def _health_handler(self, request: web.Request) -> web.Response:
+        """Return a simple health check response for GET and HEAD probes."""
 
-        if request.path == "/healthz":
-            return connection.respond(HTTPStatus.OK, "OK\n")
-        if request.path != self._path:
-            return connection.respond(HTTPStatus.NOT_FOUND, "Not Found\n")
-        return None
+        return web.Response(text="OK\n")
 
-    async def _handle_websocket(self, websocket: ServerConnection) -> None:
-        """Authenticate a client and process its protocol messages."""
+    async def _websocket_handler(self, request: web.Request) -> web.WebSocketResponse:
+        """Upgrade the request to a websocket and process the chat protocol."""
+
+        websocket = web.WebSocketResponse(heartbeat=30)
+        await websocket.prepare(request)
 
         client: ClientConnection | None = None
         try:
@@ -441,21 +444,26 @@ class SecureChatServer:
             await client.send(
                 {"type": "hello", "identity": client.identity, "message": "connected to server"}
             )
-            async for raw_message in websocket:
-                if not isinstance(raw_message, str):
-                    raise ProtocolError("Protocol messages must be text frames.")
-                payload = decode_message(raw_message)
-                await self._handle_request(client, payload)
-        except (ProtocolError, ValueError) as exc:
+
+            async for message in websocket:
+                if message.type == WSMsgType.TEXT:
+                    payload = decode_message(message.data)
+                    await self._handle_request(client, payload)
+                    continue
+                if message.type in (WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.CLOSING):
+                    break
+                if message.type == WSMsgType.ERROR:
+                    break
+        except (ProtocolError, ValueError, asyncio.TimeoutError) as exc:
             if client is not None:
                 await client.send({"type": "server_notice", "message": str(exc)})
-        except (ConnectionClosed, asyncio.TimeoutError):
-            pass
         finally:
             if client is not None:
                 await self._realtime.leave(client)
                 await self._realtime.unregister(client)
                 await client.close()
+
+        return websocket
 
     async def _handle_request(self, client: ClientConnection, payload: dict[str, Any]) -> None:
         """Dispatch a request payload to the appropriate handler."""
