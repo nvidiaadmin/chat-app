@@ -455,8 +455,12 @@ class SecureChatServer:
                 if message.type == WSMsgType.ERROR:
                     break
         except (ProtocolError, ValueError, asyncio.TimeoutError) as exc:
+            print(f"WebSocket authentication/protocol error: {exc}", flush=True)
             if client is not None:
                 await client.send({"type": "server_notice", "message": str(exc)})
+            else:
+                with contextlib.suppress(Exception):
+                    await websocket.send_str(encode_message({"type": "server_notice", "message": str(exc)}))
         finally:
             if client is not None:
                 await self._realtime.leave(client)
