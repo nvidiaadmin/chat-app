@@ -75,6 +75,8 @@ class ClientConfig:
 class SecureClientConnection:
     """Maintains one WebSocket connection and multiplexes responses/events."""
 
+    STARTUP_TIMEOUT_SECONDS = 45
+
     def __init__(self, config: ClientConfig, private_key: Any) -> None:
         self._config = config
         self._private_key = private_key
@@ -87,6 +89,7 @@ class SecureClientConnection:
         self._thread: threading.Thread | None = None
         self._websocket = None
         self._stop_requested = False
+        self._startup_error: str | None = None
 
     @property
     def event_queue(self) -> "queue.Queue[dict[str, Any]]":
@@ -100,8 +103,14 @@ class SecureClientConnection:
         self._thread = threading.Thread(target=self._thread_main, daemon=True)
         self._thread.start()
 
-        if not self._hello_event.wait(timeout=10):
-            raise RuntimeError("Server did not complete the authentication handshake.")
+        if not self._hello_event.wait(timeout=self.STARTUP_TIMEOUT_SECONDS):
+            raise RuntimeError(
+                "Server did not complete the authentication handshake "
+                f"within {self.STARTUP_TIMEOUT_SECONDS} seconds. "
+                "Check the WebSocket URL and whether the Render service is awake."
+            )
+        if self._startup_error is not None:
+            raise RuntimeError(self._startup_error)
         if self._hello_payload is None:
             raise RuntimeError("Connection closed during authentication.")
         return str(self._hello_payload.get("identity", "")).strip()
@@ -158,7 +167,11 @@ class SecureClientConnection:
             ssl_context = ssl.create_default_context()
 
         try:
-            async with connect(self._config.server_url, ssl=ssl_context) as websocket:
+            async with connect(
+                self._config.server_url,
+                ssl=ssl_context,
+                open_timeout=self.STARTUP_TIMEOUT_SECONDS,
+            ) as websocket:
                 self._websocket = websocket
                 await self._authenticate()
                 async for raw_message in websocket:
@@ -173,7 +186,13 @@ class SecureClientConnection:
                             waiter.put(payload)
                         continue
                     self._event_queue.put(payload)
-        except (ConnectionClosed, OSError, ProtocolError, RequestError) as exc:
+        except (asyncio.TimeoutError, ConnectionClosed, OSError, ProtocolError, RequestError) as exc:
+            self._startup_error = str(exc) or exc.__class__.__name__
+            self._hello_event.set()
+            self._event_queue.put({"type": "server_notice", "message": self._startup_error})
+        except Exception as exc:
+            self._startup_error = f"{exc.__class__.__name__}: {exc}"
+            self._hello_event.set()
             self._event_queue.put({"type": "server_notice", "message": str(exc)})
         finally:
             self._hello_event.set()
