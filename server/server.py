@@ -404,9 +404,7 @@ class SecureChatServer:
         app.add_routes(
             [
                 web.get("/health", self._health_handler),
-                web.head("/health", self._health_handler),
                 web.get("/healthz", self._health_handler),
-                web.head("/healthz", self._health_handler),
                 web.get(self._path, self._websocket_handler),
             ]
         )
