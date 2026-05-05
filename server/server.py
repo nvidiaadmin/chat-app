@@ -289,8 +289,12 @@ class RealtimeCoordinator:
 
         async with self._lock:
             current = self._clients.get(client.identity)
-            if current is client:
-                self._clients.pop(client.identity, None)
+            if current is not client:
+                client.realtime.active_peer = None
+                client.realtime.desired_peer = None
+                return
+
+            self._clients.pop(client.identity, None)
             active_peer = client.realtime.active_peer
             client.realtime.active_peer = None
             client.realtime.desired_peer = None
