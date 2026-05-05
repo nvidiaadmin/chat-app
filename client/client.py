@@ -324,18 +324,29 @@ class OfflineReadMode:
 
     @staticmethod
     def _read_single_key() -> str:
-        """Read one key from standard input without requiring Enter."""
+        """Read one key from stdin without Enter (cross-platform)."""
+        import sys
 
-        import termios
-        import tty
+        if sys.platform.startswith('win'):
+            import msvcrt
+            key = msvcrt.getch()
+            if key in (b'\x00', b'\xe0'):
+                key = msvcrt.getch()
+            try:
+                return key.decode('utf-8')
+            except UnicodeDecodeError:
+                return ''
+        else:
+            import termios
+            import tty
 
-        file_descriptor = sys.stdin.fileno()
-        original_settings = termios.tcgetattr(file_descriptor)
-        try:
-            tty.setraw(file_descriptor)
-            return sys.stdin.read(1)
-        finally:
-            termios.tcsetattr(file_descriptor, termios.TCSADRAIN, original_settings)
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                return sys.stdin.read(1)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
 class RealtimeChatMode:

@@ -285,26 +285,20 @@ class RealtimeCoordinator:
             await previous.close()
 
     async def unregister(self, client: ClientConnection) -> None:
-        """Remove a disconnected client and unwind any active realtime pair."""
+        """Remove a disconnected client and leave peers waiting for reconnection."""
 
         async with self._lock:
             current = self._clients.get(client.identity)
             if current is client:
                 self._clients.pop(client.identity, None)
             active_peer = client.realtime.active_peer
-            desired_peer = client.realtime.desired_peer
             client.realtime.active_peer = None
             client.realtime.desired_peer = None
 
             peer = self._clients.get(active_peer) if active_peer else None
-            waiting_peer = self._clients.get(desired_peer) if desired_peer else None
 
             if peer and peer.realtime.active_peer == client.identity:
                 peer.realtime.active_peer = None
-                if peer.realtime.desired_peer == client.identity:
-                    peer.realtime.desired_peer = None
-            if waiting_peer and waiting_peer.realtime.desired_peer == client.identity:
-                waiting_peer.realtime.desired_peer = None
 
         if peer:
             await peer.send(
@@ -404,7 +398,9 @@ class SecureChatServer:
         app.add_routes(
             [
                 web.get("/health", self._health_handler),
+                web.head("/health", self._health_handler),
                 web.get("/healthz", self._health_handler),
+                web.head("/healthz", self._health_handler),
                 web.get(self._path, self._websocket_handler),
             ]
         )
@@ -461,7 +457,6 @@ class SecureChatServer:
                     await websocket.send_str(encode_message({"type": "server_notice", "message": str(exc)}))
         finally:
             if client is not None:
-                await self._realtime.leave(client)
                 await self._realtime.unregister(client)
                 await client.close()
 
